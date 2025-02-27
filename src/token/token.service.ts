@@ -1,180 +1,215 @@
-import { Injectable } from '@nestjs/common';
+import {
+  Injectable,
+  OnModuleDestroy,
+  OnModuleInit,
+  Logger,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Redis } from 'ioredis';
+import { v4 as uuidv4 } from 'uuid';
 
 @Injectable()
-export class TokenService {
+export class TokenService implements OnModuleInit, OnModuleDestroy {
   private redis: Redis;
-  private TOKEN_EXPIRY: number;
-  private KEEP_ALIVE_EXPIRY: number;
+  private subscriber: Redis;
+  private readonly TOKEN_EXPIRY: number;
+  private readonly KEEP_ALIVE_EXPIRY: number;
+  private readonly logger = new Logger(TokenService.name);
 
   constructor(private readonly configService: ConfigService) {
-    // Redis on localhost
-    this.redis = new Redis({
-      host: this.configService.get('REDIS_HOST'),
-      port: Number(this.configService.get('REDIS_PORT')),
-    });
-
-    // Connect to redis server
-    // this.redis = new Redis({
-    //   host: this.configService.get('REDIS_HOST'),
-    //   port: Number(this.configService.get('REDIS_PORT')),
-    //   password: this.configService.get('REDIS_PASSWORD'),
-    //   tls: this.configService.get('REDIS_TLS') === 'true' ? {} : undefined,
-    // });
-
+    this.redis = this.createRedisClient();
+    this.subscriber = this.createRedisClient();
+    this.TOKEN_EXPIRY = Number(this.configService.get('TOKEN_EXPIRY'));
     this.KEEP_ALIVE_EXPIRY = Number(
       this.configService.get('KEEP_ALIVE_EXPIRY'),
     );
-    this.TOKEN_EXPIRY = Number(this.configService.get('TOKEN_EXPIRY'));
+  }
 
-    // Subscribe to Redis expired key event
-    const subscriber = new Redis({
+  /** Initialize the service (Subscribe to Redis events) */
+  async onModuleInit() {
+    try {
+      await this.subscribeToTokenExpiry();
+      this.logger.log('✅ TokenService initialized successfully.');
+    } catch (error) {
+      this.logger.error('❌ Error initializing TokenService:', error);
+    }
+  }
+
+  /** Clean up resources when module is destroyed */
+  async onModuleDestroy() {
+    this.redis.disconnect();
+    this.subscriber.disconnect();
+    this.logger.log('ℹ️ Redis connections closed.');
+  }
+
+  /** Create a Redis client */
+  private createRedisClient(): Redis {
+    return new Redis({
       host: this.configService.get('REDIS_HOST'),
       port: Number(this.configService.get('REDIS_PORT')),
+      password: this.configService.get('REDIS_PASSWORD') || undefined,
+      tls: this.configService.get('REDIS_TLS') === 'true' ? {} : undefined,
+      retryStrategy: (times) => Math.min(times * 50, 2000), // Retry logic
     });
+  }
 
-    subscriber.subscribe('__keyevent@0__:expired', (err) => {
-      if (err) {
-        console.error('Redis subscription error:', err);
-      }
-    });
-
-    subscriber.on('message', async (channel, message) => {
-      if (
-        channel === '__keyevent@0__:expired' &&
-        message.startsWith('token:')
-      ) {
-        const token = message.replace('token:', '');
-
-        // Check if the token was assigned before expiring
-        const isAssigned = await this.redis.sismember('assigned_tokens', token);
-
-        if (isAssigned) {
-          console.log(
-            `Assigned token expired: ${token}, adding back to available pool`,
-          );
-
-          await this.redis.sadd('available_tokens', token);
-          await this.redis.set(
-            `token:${token}`,
-            'free',
-            'EX',
-            this.TOKEN_EXPIRY,
-          );
-          // Remove from assigned set since it's back in available pool
-          await this.redis.srem('assigned_tokens', token);
-        } else {
-          await this.redis.srem('available_tokens', token);
-          console.log(
-            `Unassigned token expired: ${token}, deleting permanently`,
-          );
+  /** Subscribe to Redis key expiry events */
+  private async subscribeToTokenExpiry() {
+    try {
+      await this.subscriber.subscribe('__keyevent@0__:expired');
+      this.subscriber.on('message', async (channel, message) => {
+        if (
+          channel === '__keyevent@0__:expired' &&
+          message.startsWith('token:')
+        ) {
+          await this.handleExpiredToken(message.replace('token:', ''));
         }
+      });
+      this.logger.log('🔄 Subscribed to Redis key expiration events.');
+    } catch (error) {
+      this.logger.error('❌ Failed to subscribe to Redis events:', error);
+    }
+  }
+
+  /** Handle expired tokens */
+  private async handleExpiredToken(token: string) {
+    try {
+      const isAssigned = await this.redis.sismember('assigned_tokens', token);
+
+      if (isAssigned) {
+        this.logger.warn(
+          `⚠️ Assigned token expired: ${token}, moving back to available pool.`,
+        );
+        await this.redis.sadd('available_tokens', token);
+        await this.redis.set(`token:${token}`, 'free', 'EX', this.TOKEN_EXPIRY);
+        await this.redis.srem('assigned_tokens', token);
+      } else {
+        this.logger.log(
+          `🗑️ Unassigned token expired: ${token}, deleting permanently.`,
+        );
+        await this.redis.srem('available_tokens', token);
       }
-    });
+    } catch (error) {
+      this.logger.error(`❌ Error handling expired token ${token}:`, error);
+    }
   }
 
   /** 🎟️ Create multiple tokens */
   async createMultipleTokens(count: number): Promise<void> {
-    for (let i = 0; i < count; i++) {
-      const token = `token-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`;
-
-      // Store token with status
-      await this.redis.set(`token:${token}`, 'free', 'EX', this.TOKEN_EXPIRY);
-
-      // Add to available set
-      await this.redis.sadd('available_tokens', token);
+    try {
+      for (let i = 0; i < count; i++) {
+        const token = `${uuidv4().split('-')[0]}-${Date.now()}`;
+        await this.redis.set(`token:${token}`, 'free', 'EX', this.TOKEN_EXPIRY);
+        await this.redis.sadd('available_tokens', token);
+      }
+      this.logger.log(`✅ Created ${count} tokens.`);
+    } catch (error) {
+      this.logger.error('❌ Error creating tokens:', error);
     }
   }
 
-  /** 🎮 Assign a token (O(1)) */
+  /** 🎮 Assign a token */
   async assignToken(): Promise<string | false> {
-    const token = await this.redis.spop('available_tokens');
-    if (!token) return false;
+    try {
+      const token = await this.redis.spop('available_tokens');
+      if (!token) return false;
 
-    await this.redis.set(
-      `token:${token}`,
-      'assigned',
-      'EX',
-      this.KEEP_ALIVE_EXPIRY,
-    );
-    await this.redis.sadd('assigned_tokens', token);
-    return token;
+      await this.redis.set(
+        `token:${token}`,
+        'assigned',
+        'EX',
+        this.KEEP_ALIVE_EXPIRY,
+      );
+      await this.redis.sadd('assigned_tokens', token);
+      return token;
+    } catch (error) {
+      this.logger.error('❌ Error assigning token:', error);
+      return false;
+    }
   }
 
+  /** 📜 Get all assigned tokens */
   async getAssignedTokens(): Promise<{ token: string; expiry: number }[]> {
-    const assignedTokens = await this.redis.smembers('assigned_tokens');
-    const tokens = await Promise.all(
-      assignedTokens.map(async (token) => {
-        const ttl = await this.redis.ttl(`token:${token}`);
-        return {
+    try {
+      const assignedTokens = await this.redis.smembers('assigned_tokens');
+      return Promise.all(
+        assignedTokens.map(async (token) => ({
           token,
-          expiry: ttl > 0 ? Date.now() + ttl * 1000 : 0,
-        };
-      }),
-    );
-    return tokens;
+          expiry: (await this.redis.ttl(`token:${token}`)) * 1000 + Date.now(),
+        })),
+      );
+    } catch (error) {
+      this.logger.error('❌ Error fetching assigned tokens:', error);
+      return [];
+    }
   }
 
+  /** 📜 Get all tokens */
   async getAllTokens(): Promise<
     { token: string; status: string; expiry: number }[]
   > {
-    const keys = await this.redis.keys('token:*');
-    const tokens = await Promise.all(
-      keys.map(async (key) => {
-        const status = await this.redis.get(key);
-        const ttl = await this.redis.ttl(key);
-        return {
+    try {
+      const keys = await this.redis.keys('token:*');
+      return Promise.all(
+        keys.map(async (key) => ({
           token: key.replace('token:', ''),
-          status,
-          expiry: Date.now() + ttl * 1000,
-        };
-      }),
-    );
-    return tokens;
+          status: await this.redis.get(key),
+          expiry: (await this.redis.ttl(key)) * 1000 + Date.now(),
+        })),
+      );
+    } catch (error) {
+      this.logger.error('❌ Error fetching all tokens:', error);
+      return [];
+    }
   }
 
   /** 🔓 Free a token */
   async freeToken(token: string): Promise<boolean> {
-    const key = `token:${token}`;
-    const isTokenExists = await this.redis.exists(key);
-    const isAssigned = await this.redis.sismember('assigned_tokens', token); // Use SISMEMBER if stored as a Set
+    try {
+      const key = `token:${token}`;
+      const isAssigned = await this.redis.sismember('assigned_tokens', token);
 
-    if (!isTokenExists || !isAssigned) return false;
+      if (!isAssigned) return false;
 
-    // Reset the expiration to 5 minutes (300 seconds)
-    await this.redis.set(key, 'free', 'EX', this.TOKEN_EXPIRY);
-    await this.redis.sadd('available_tokens', token);
-    await this.redis.srem('assigned_tokens', token);
-    return true;
+      await this.redis.set(key, 'free', 'EX', this.TOKEN_EXPIRY);
+      await this.redis.sadd('available_tokens', token);
+      await this.redis.srem('assigned_tokens', token);
+      return true;
+    } catch (error) {
+      this.logger.error(`❌ Error freeing token ${token}:`, error);
+      return false;
+    }
   }
 
   /** ❌ Delete a token */
   async deleteToken(token: string): Promise<boolean> {
-    const key = `token:${token}`;
-    const isTokenExists = await this.redis.exists(key);
-    if (isTokenExists) {
+    try {
+      const key = `token:${token}`;
+      const isTokenExists = await this.redis.exists(key);
+      if (!isTokenExists) return false;
+
       await this.redis.del(key);
-      const isAssigned = await this.redis.sismember('assigned_tokens', token);
-      if (isAssigned) await this.redis.srem('assigned_tokens', token);
-      const isAvailable = await this.redis.sismember('available_tokens', token);
-      if (isAvailable) await this.redis.srem('available_tokens', token);
+      await this.redis.srem('assigned_tokens', token);
+      await this.redis.srem('available_tokens', token);
       return true;
+    } catch (error) {
+      this.logger.error(`❌ Error deleting token ${token}:`, error);
+      return false;
     }
-    return false;
   }
 
   /** 🛡️ Keep a token alive */
   async keepAlive(token: string): Promise<boolean> {
-    const key = `token:${token}`;
+    try {
+      const key = `token:${token}`;
+      const isAssigned = await this.redis.sismember('assigned_tokens', token);
+      if (!isAssigned) return false;
 
-    // Check if the token exists in Redis and is in the assigned_tokens set
-    const isTokenExists = await this.redis.exists(key);
-    const isAssigned = await this.redis.sismember('assigned_tokens', token); // Use SISMEMBER if stored as a Set
-
-    if (!isTokenExists || !isAssigned) return false;
-
-    await this.redis.expire(key, this.KEEP_ALIVE_EXPIRY); // Extend expiry by 1 minute
-    return true;
+      await this.redis.expire(key, this.KEEP_ALIVE_EXPIRY);
+      return true;
+    } catch (error) {
+      this.logger.error(`❌ Error keeping token ${token} alive:`, error);
+      return false;
+    }
   }
 }
