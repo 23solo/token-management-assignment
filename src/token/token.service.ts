@@ -202,11 +202,14 @@ export class TokenService implements OnModuleInit, OnModuleDestroy {
   async keepAlive(token: string): Promise<boolean> {
     try {
       const key = `token:${token}`;
-      const isAssigned = await this.redis.sismember('assigned_tokens', token);
-      if (!isAssigned) return false;
-
-      await this.redis.expire(key, this.KEEP_ALIVE_EXPIRY);
-      return true;
+      const isTokenExists = await this.redis.exists(key);
+      if (isTokenExists) {
+        const isAssigned = await this.redis.sismember('assigned_tokens', token);
+        if (isAssigned) await this.redis.expire(key, this.KEEP_ALIVE_EXPIRY);
+        else await this.redis.expire(key, this.TOKEN_EXPIRY);
+        return true;
+      }
+      return false;
     } catch (error) {
       this.logger.error(`❌ Error keeping token ${token} alive:`, error);
       return false;
